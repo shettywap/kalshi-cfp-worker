@@ -16,7 +16,10 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
+
+# MUST BE THIS. Sports markets also come from this API.
 BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+
 CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
 
 MIN_MOVE = float(os.getenv("MIN_MOVE", "0.5"))
@@ -53,6 +56,7 @@ def load_private_key():
 
 PRIVATE_KEY = load_private_key()
 
+
 def sign_message(message: str) -> str:
     signature = PRIVATE_KEY.sign(
         message.encode("utf-8"),
@@ -80,7 +84,7 @@ def kalshi_signed_get(path: str):
     message = timestamp + method + parsed.path
 
     headers = {
-        "KALSHI-ACCESS-KEY": API_KEY_ID,
+        "KALSHHI-ACCESS-KEY": API_KEY_ID,
         "KALSHI-ACCESS-TIMESTAMP": timestamp,
         "KALSHI-ACCESS-SIGNATURE": sign_message(message),
         "Content-Type": "application/json",
@@ -105,22 +109,26 @@ def kalshi_get_json(path: str):
 # ==========================
 
 def fetch_cfp_market_tickers():
-    """Return ONLY real market tickers, skipping event objects."""
+    """Return ONLY real market tickers (skip event objects)."""
     data = kalshi_get_json(f"/markets?event_ticker={CFP_EVENT_TICKER}")
-    markets = data.get("markets", [])
 
-    real_markets = []
+    # PRINT RAW FOR DEBUG — This will reveal the real issue if markets=0.
+    print("RAW_MARKETS_RESPONSE:", json.dumps(data, indent=2)[:800])
+
+    markets = data.get("markets", [])
+    real = []
 
     for m in markets:
-        # Skip event entries (they have null prices & broad titles)
-        if m.get("yes_price") is None and m.get("no_price") is None:
-            continue
-        real_markets.append(m["ticker"])
+        # Market = has yes/no prices OR has type "market"
+        if m.get("yes_price") is not None or m.get("no_price") is not None:
+            real.append(m["ticker"])
 
-    return real_markets
+    print(f"FOUND {len(markets)} entries, {len(real)} real markets")
+    return real
 
 
 def fetch_market(ticker: str):
+    """Get full market details."""
     data = kalshi_get_json(f"/market?ticker={ticker}")
     return data.get("market", {})
 
@@ -138,7 +146,7 @@ def process_once():
     now = datetime.now(timezone.utc)
 
     batch = db.batch()
-    movers_to_add = []
+    movers = []
     samples = []
 
     for t in tickers:
@@ -148,7 +156,7 @@ def process_once():
         title = m.get("title", t)
         volume = m.get("volume")
 
-        # update Firestore doc
+        # save market
         doc_ref = db.collection("cfp_markets").document(t)
         batch.set(
             doc_ref,
@@ -163,22 +171,22 @@ def process_once():
             merge=True,
         )
 
-        # movement detection
+        # detect price move
         prev = prev_prices.get(t)
-        if yes_price is not None and prev is not None and yes_price != prev:
+        if prev is not None and yes_price is not None and yes_price != prev:
             diff = yes_price - prev
             if len(samples) < 5:
                 samples.append(f"{t}: {prev} → {yes_price}")
 
-            movers_to_add.append({
+            movers.append({
                 "ticker": t,
                 "team": title,
                 "prev_yes": prev,
                 "curr_yes": yes_price,
                 "diff": diff,
                 "significant": abs(diff) >= MIN_MOVE,
-                "event_ticker": CFP_EVENT_TICKER,
                 "detected_at": now,
+                "event_ticker": CFP_EVENT_TICKER,
             })
 
         if yes_price is not None:
@@ -186,10 +194,14 @@ def process_once():
 
     batch.commit()
 
-    for mv in movers_to_add:
+    for mv in movers:
         db.collection("cfp_movers").add(mv)
 
-    print(f"{now.isoformat()} | tickers={len(tickers)} | movers={len(movers_to_add)} | samples={samples or 'none'}")
+    print(
+        f"{now.isoformat()} | tickers={len(tickers)} "
+        f"| movers={len(movers)} "
+        f"| samples={samples or 'none'}"
+    )
 
 
 if __name__ == "__main__":
