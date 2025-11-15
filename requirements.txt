@@ -2,4 +2,5 @@ google-cloud-firestore
 google-auth
 requests
 cryptography
+firebase-admin==6.5.0
 
