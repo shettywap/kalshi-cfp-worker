@@ -10,47 +10,48 @@ from google.oauth2 import service_account
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# ==========================
+# ============================================================
 # CONFIG
-# ==========================
+# ============================================================
 
 API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
 
-# MUST BE https://api.elections.kalshi.com/trade-api/v2
-BASE_URL = os.getenv(
-    "KALSHI_BASE_URL",
-    "https://api.elections.kalshi.com/trade-api/v2"
-)
+# SPORTS MARKETS LIVE IN V3, NOT V2
+BASE_URL = "https://api.elections.kalshi.com/trade-api/v3"
 
-# CFP prefix — WE NOW SEARCH BY PREFIX, NOT EVENT GROUPING
-CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
+CFP_PREFIX = "KXNCAAFPLAYOFF-25-"   # THIS IS THE ONLY RELIABLE IDENTIFIER
 
-MIN_MOVE = float(os.getenv("MIN_MOVE", "0.5"))
+MIN_MOVE = float(os.getenv("MIN_MOVE", "1"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
 
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 
 if not API_KEY_ID:
-    raise RuntimeError("KALSHI_API_KEY_ID not set.")
+    raise RuntimeError("KALSHI_API_KEY_ID not set")
 if not PRIVATE_KEY_PEM:
-    raise RuntimeError("KALSHI_PRIVATE_KEY_PEM not set.")
+    raise RuntimeError("KALSHI_PRIVATE_KEY_PEM not set")
 if not FIREBASE_SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON not set.")
+    raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON not set")
 
 
-# ==========================
-# FIRESTORE
-# ==========================
+# ============================================================
+# FIRESTORE INIT
+# ============================================================
 
 service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
-firebase_creds = service_account.Credentials.from_service_account_info(service_account_info)
-db = firestore.Client(project=service_account_info["project_id"], credentials=firebase_creds)
+firebase_creds = service_account.Credentials.from_service_account_info(
+    service_account_info
+)
+db = firestore.Client(
+    project=service_account_info["project_id"],
+    credentials=firebase_creds,
+)
 
 
-# ==========================
-# KALSHI SIGNING
-# ==========================
+# ============================================================
+# SIGNING
+# ============================================================
 
 def load_private_key():
     return serialization.load_pem_private_key(
@@ -78,10 +79,9 @@ def kalshi_signed_get(path: str):
     base = BASE_URL.rstrip("/")
     if not path.startswith("/"):
         path = "/" + path
-
     url = base + path
-    parsed = urlparse(url)
 
+    parsed = urlparse(url)
     method = "GET"
     timestamp = str(int(time.time() * 1000))
     message = timestamp + method + parsed.path
@@ -96,78 +96,79 @@ def kalshi_signed_get(path: str):
     return requests.get(url, headers=headers, timeout=10)
 
 
-def kalshi_get_json(path: str):
+def kalshi_json(path: str):
     resp = kalshi_signed_get(path)
     try:
         data = resp.json()
     except:
-        raise RuntimeError(f"Non-JSON ({resp.status_code}): {resp.text[:200]}")
+        raise RuntimeError(f"Non-JSON response ({resp.status_code}): {resp.text}")
+
     if resp.status_code != 200:
         raise RuntimeError(
-            f"Kalshi returned {resp.status_code}:\n{json.dumps(data, indent=2)}"
+            f"Kalshi error {resp.status_code}:\n{json.dumps(data, indent=2)}"
         )
+
     return data
 
 
-# ==========================
-# MARKET FETCHING (FIXED)
-# ==========================
+# ============================================================
+# MARKET FETCHING (v3 only)
+# ============================================================
 
-def fetch_cfp_market_tickers():
-    """
-    Fetch CFP markets using prefix search, because Kalshi does NOT attach
-    these markets to the event group. Your Colab uses these tickers:
-    KXNCAAFPLAYOFF-25-OSU, KXNCAAFPLAYOFF-25-ND, etc.
-    """
-    path = f"/markets?search={CFP_EVENT_TICKER}-"
-    data = kalshi_get_json(path)
-
-    # DEBUG: Show raw response
-    print("RAW_MARKETS_RESPONSE:", json.dumps(data, indent=2)[:800])
-
+def fetch_cfp_markets():
+    """Fetch all CFP markets using v3 search API."""
+    data = kalshi_json(f"/markets?search={CFP_PREFIX}")
     markets = data.get("markets", [])
 
-    # CFP markets have YES/NO prices.
-    tickers = [
-        m["ticker"]
-        for m in markets
-        if m.get("yes_price") is not None
-    ]
+    # Log sample of what we're getting
+    print(f"RAW_RESPONSE_COUNT={len(markets)}")
 
-    print(f"FOUND {len(markets)} total entries, {len(tickers)} real CFP markets")
-    return tickers
+    # Keep only real CFP yes/no markets
+    cfp = []
+    for m in markets:
+        t = m.get("ticker", "")
+        if t.startswith(CFP_PREFIX) and m.get("yes_price") is not None:
+            cfp.append(m)
+
+    print(f"FOUND_CFP_MARKETS={len(cfp)}")
+    return cfp
 
 
-def fetch_market(ticker: str):
-    data = kalshi_get_json(f"/market?ticker={ticker}")
+def fetch_market_details(ticker: str):
+    """Fetch a single market by ticker."""
+    data = kalshi_json(f"/market?ticker={ticker}")
     return data.get("market", {})
 
 
-# ==========================
-# POLLING LOOP
-# ==========================
+# ============================================================
+# POLLER LOOP
+# ============================================================
 
 prev_prices = {}
 
-def process_once():
+def poll_once():
     global prev_prices
 
-    tickers = fetch_cfp_market_tickers()
     now = datetime.now(timezone.utc)
+
+    markets = fetch_cfp_markets()
+    if not markets:
+        print(f"{now.isoformat()} | No CFP markets found in v3 search")
+        return
 
     batch = db.batch()
     movers = []
-    samples = []
 
-    for t in tickers:
-        m = fetch_market(t)
-
+    for m in markets:
+        t = m["ticker"]
+        title = m.get("title", t)
         yes_price = m.get("yes_price")
         no_price = m.get("no_price")
-        title = m.get("title", t)
         volume = m.get("volume")
 
-        # Save market snapshot
+        # ------------------------
+        # Store snapshot
+        # ------------------------
         doc_ref = db.collection("cfp_markets").document(t)
         batch.set(
             doc_ref,
@@ -177,18 +178,17 @@ def process_once():
                 "yes_price": yes_price,
                 "no_price": no_price,
                 "volume": volume,
-                "event_ticker": CFP_EVENT_TICKER,
                 "updated_at": now,
             },
-            merge=True,
+            merge=True
         )
 
-        # Detect movement
+        # ------------------------
+        # Movement detection
+        # ------------------------
         prev = prev_prices.get(t)
         if prev is not None and yes_price is not None and yes_price != prev:
             diff = yes_price - prev
-            if len(samples) < 5:
-                samples.append(f"{t}: {prev} → {yes_price}")
 
             movers.append({
                 "ticker": t,
@@ -198,7 +198,6 @@ def process_once():
                 "diff": diff,
                 "significant": abs(diff) >= MIN_MOVE,
                 "detected_at": now,
-                "event_ticker": CFP_EVENT_TICKER,
             })
 
         if yes_price is not None:
@@ -206,20 +205,26 @@ def process_once():
 
     batch.commit()
 
+    # Store movers
     for mv in movers:
         db.collection("cfp_movers").add(mv)
 
     print(
-        f"{now.isoformat()} | tickers={len(tickers)} "
+        f"{now.isoformat()} | tickers={len(markets)} "
         f"| movers={len(movers)} "
-        f"| samples={samples or 'none'}"
+        f"| examples={movers[:2]}"
     )
 
 
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
 if __name__ == "__main__":
+    print("=== CFP WORKER STARTED (v3 API) ===")
     while True:
         try:
-            process_once()
+            poll_once()
         except Exception as e:
-            print("Error:", e)
+            print("ERROR in poller:", e)
         time.sleep(POLL_INTERVAL)
