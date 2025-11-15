@@ -22,8 +22,9 @@ BASE_URL = os.getenv(
 )
 CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
 
-MIN_MOVE = float(os.getenv("MIN_MOVE", "2"))        # points to count as movement
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))  # seconds between polls
+# Smaller default so we treat more moves as "significant"
+MIN_MOVE = float(os.getenv("MIN_MOVE", "0.5"))        # points
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))  # seconds
 
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 
@@ -120,6 +121,7 @@ def fetch_cfp_markets():
 #  POLLER LOOP
 # ==========================
 
+# In-memory map of last seen YES prices, per ticker
 prev_prices = {}  # ticker -> last YES
 
 
@@ -132,6 +134,10 @@ def process_once():
     batch = db.batch()
     movers_to_add = []
 
+    # Debug counters
+    changed_count = 0
+    max_diff = 0.0
+
     for m in markets:
         ticker = m.get("ticker")
         team = m.get("title", ticker)
@@ -139,7 +145,7 @@ def process_once():
         no_price = m.get("no_price")
         volume = m.get("volume")
 
-        # 1) Upsert current market doc
+        # 1) Upsert current market doc (one doc per ticker)
         doc_ref = db.collection("cfp_markets").document(ticker)
         batch.set(
             doc_ref,
@@ -158,21 +164,30 @@ def process_once():
         # 2) Movement detection
         if yes_price is not None and ticker in prev_prices:
             diff = yes_price - prev_prices[ticker]
-            if abs(diff) >= MIN_MOVE:
+
+            if diff != 0:
+                changed_count += 1
+                max_diff = max(max_diff, abs(diff))
+
+                # ✅ NEW: log every change as a mover (not just >= MIN_MOVE)
+                significant = abs(diff) >= MIN_MOVE
+
                 movers_to_add.append({
                     "team": team,
                     "ticker": ticker,
                     "prev_yes": prev_prices[ticker],
                     "curr_yes": yes_price,
                     "diff": diff,
+                    "significant": significant,      # extra field, safe to ignore in app
                     "event_ticker": CFP_EVENT_TICKER,
                     "detected_at": now,
                 })
 
+        # Update last seen price
         if yes_price is not None:
             prev_prices[ticker] = yes_price
 
-    # Commit all market docs at once
+    # Commit market updates in one batch
     batch.commit()
 
     # Commit movers as individual docs
@@ -181,7 +196,9 @@ def process_once():
 
     print(
         f"{now.isoformat()} - updated {len(markets)} markets, "
-        f"{len(movers_to_add)} movers"
+        f"{len(movers_to_add)} movers (any change), "
+        f"tickers with any change: {changed_count}, "
+        f"max diff: {max_diff}, MIN_MOVE={MIN_MOVE}"
     )
 
 
@@ -190,5 +207,6 @@ if __name__ == "__main__":
         try:
             process_once()
         except Exception as e:
+            # Simple safety logging so the loop doesn't silently die
             print("Error in poller:", e)
         time.sleep(POLL_INTERVAL)
