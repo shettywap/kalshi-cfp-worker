@@ -22,9 +22,9 @@ BASE_URL = os.getenv(
 )
 CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
 
-# Smaller default so we treat more moves as "significant"
-MIN_MOVE = float(os.getenv("MIN_MOVE", "0.5"))        # points
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))  # seconds
+# Default: small threshold, but we now log ALL changes anyway
+MIN_MOVE = float(os.getenv("MIN_MOVE", "0.5"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
 
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 
@@ -134,9 +134,9 @@ def process_once():
     batch = db.batch()
     movers_to_add = []
 
-    # Debug counters
     changed_count = 0
     max_diff = 0.0
+    sample_changes = []  # collect a few examples for logging
 
     for m in markets:
         ticker = m.get("ticker")
@@ -161,24 +161,30 @@ def process_once():
             merge=True,
         )
 
-        # 2) Movement detection
-        if yes_price is not None and ticker in prev_prices:
-            diff = yes_price - prev_prices[ticker]
-
+        # 2) Movement detection relative to last seen
+        prev_yes = prev_prices.get(ticker)
+        if yes_price is not None and prev_yes is not None:
+            diff = yes_price - prev_yes
             if diff != 0:
                 changed_count += 1
                 max_diff = max(max_diff, abs(diff))
 
-                # ✅ NEW: log every change as a mover (not just >= MIN_MOVE)
+                # Record a few examples for the logs
+                if len(sample_changes) < 5:
+                    sample_changes.append(
+                        f"{ticker}: {prev_yes} -> {yes_price} (diff={diff})"
+                    )
+
+                # Log EVERY change as a mover
                 significant = abs(diff) >= MIN_MOVE
 
                 movers_to_add.append({
                     "team": team,
                     "ticker": ticker,
-                    "prev_yes": prev_prices[ticker],
+                    "prev_yes": prev_yes,
                     "curr_yes": yes_price,
                     "diff": diff,
-                    "significant": significant,      # extra field, safe to ignore in app
+                    "significant": significant,
                     "event_ticker": CFP_EVENT_TICKER,
                     "detected_at": now,
                 })
@@ -194,11 +200,17 @@ def process_once():
     for mv in movers_to_add:
         db.collection("cfp_movers").add(mv)
 
+    # Build a compact summary line for the logs
+    if sample_changes:
+        sample_str = " | ".join(sample_changes)
+    else:
+        sample_str = "no price changes this cycle"
+
     print(
         f"{now.isoformat()} - updated {len(markets)} markets, "
         f"{len(movers_to_add)} movers (any change), "
         f"tickers with any change: {changed_count}, "
-        f"max diff: {max_diff}, MIN_MOVE={MIN_MOVE}"
+        f"max diff: {max_diff}, MIN_MOVE={MIN_MOVE} | samples: {sample_str}"
     )
 
 
@@ -207,6 +219,5 @@ if __name__ == "__main__":
         try:
             process_once()
         except Exception as e:
-            # Simple safety logging so the loop doesn't silently die
             print("Error in poller:", e)
         time.sleep(POLL_INTERVAL)
