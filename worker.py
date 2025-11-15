@@ -1,230 +1,174 @@
 import os
 import time
 import json
-import requests
 import base64
-from datetime import datetime, timezone
-
-from google.cloud import firestore
-from google.oauth2 import service_account
+import requests
+from urllib.parse import urlparse
+from datetime import datetime
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# ============================================================
-# CONFIG
-# ============================================================
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
+# ---------------------
+# FIREBASE INIT
+# ---------------------
+if not firebase_admin._apps:
+    cred = credentials.Certificate(json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"]))
+    firebase_admin.initialize_app(cred)
 
-# SPORTS MARKETS LIVE IN V3, NOT V2
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v3"
+db = firestore.client()
 
-CFP_PREFIX = "KXNCAAFPLAYOFF-25-"   # THIS IS THE ONLY RELIABLE IDENTIFIER
+# ---------------------
+# KALSHI CONFIG
+# ---------------------
+API_KEY = os.environ["KALSHI_API_KEY"]
 
-MIN_MOVE = float(os.getenv("MIN_MOVE", "1"))
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
+BASE = "https://api.elections.kalshi.com/trade-api/v2"
+CFP_EVENT = "KXNCAAFPLAYOFF-25"
 
-FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-
-if not API_KEY_ID:
-    raise RuntimeError("KALSHI_API_KEY_ID not set")
-if not PRIVATE_KEY_PEM:
-    raise RuntimeError("KALSHI_PRIVATE_KEY_PEM not set")
-if not FIREBASE_SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON not set")
-
-
-# ============================================================
-# FIRESTORE INIT
-# ============================================================
-
-service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
-firebase_creds = service_account.Credentials.from_service_account_info(
-    service_account_info
-)
-db = firestore.Client(
-    project=service_account_info["project_id"],
-    credentials=firebase_creds,
+# Load private key
+private_key = serialization.load_pem_private_key(
+    os.environ["KALSHI_PRIVATE_KEY"].encode(),
+    password=None
 )
 
+# ---------------------
+# SIGNED REQUEST (EXACT COLAB VERSION)
+# ---------------------
+def kalshi_signed_request(method, url, body=None):
+    path = urlparse(url).path
+    timestamp = str(int(time.time() * 1000))
+    message = timestamp + method.upper() + path
 
-# ============================================================
-# SIGNING
-# ============================================================
-
-def load_private_key():
-    return serialization.load_pem_private_key(
-        PRIVATE_KEY_PEM.encode("utf-8"),
-        password=None,
-    )
-
-PRIVATE_KEY = load_private_key()
-
-def sign_message(message: str) -> str:
-    signature = PRIVATE_KEY.sign(
-        message.encode("utf-8"),
+    signature_bytes = private_key.sign(
+        message.encode(),
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
+            salt_length=padding.PSS.MAX_LENGTH
         ),
-        hashes.SHA256(),
+        hashes.SHA256()
     )
-    return base64.b64encode(signature).decode("utf-8")
 
-
-def kalshi_signed_get(path: str):
-    from urllib.parse import urlparse
-
-    base = BASE_URL.rstrip("/")
-    if not path.startswith("/"):
-        path = "/" + path
-    url = base + path
-
-    parsed = urlparse(url)
-    method = "GET"
-    timestamp = str(int(time.time() * 1000))
-    message = timestamp + method + parsed.path
+    signature = base64.b64encode(signature_bytes).decode()
 
     headers = {
-        "KALSHI-ACCESS-KEY": API_KEY_ID,
+        "KALSHI-ACCESS-KEY": API_KEY,
         "KALSHI-ACCESS-TIMESTAMP": timestamp,
-        "KALSHI-ACCESS-SIGNATURE": sign_message(message),
-        "Content-Type": "application/json",
+        "KALSHI-ACCESS-SIGNATURE": signature,
+        "Content-Type": "application/json"
     }
 
-    return requests.get(url, headers=headers, timeout=10)
+    if method == "GET":
+        return requests.get(url, headers=headers)
+    else:
+        return requests.post(url, headers=headers, data=json.dumps(body))
 
 
-def kalshi_json(path: str):
-    resp = kalshi_signed_get(path)
+# ---------------------
+# FETCH MARKETS
+# ---------------------
+def fetch_cfp_markets():
+    url = f"{BASE}/markets?event_ticker={CFP_EVENT}&limit=500"
+    resp = kalshi_signed_request("GET", url)
+
+    # Handle non-JSON
     try:
         data = resp.json()
     except:
-        raise RuntimeError(f"Non-JSON response ({resp.status_code}): {resp.text}")
+        print("❌ NON-JSON RESPONSE:", resp.text)
+        return []
 
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"Kalshi error {resp.status_code}:\n{json.dumps(data, indent=2)}"
-        )
+        print("❌ API ERROR:", data)
+        return []
 
-    return data
-
-
-# ============================================================
-# MARKET FETCHING (v3 only)
-# ============================================================
-
-def fetch_cfp_markets():
-    """Fetch all CFP markets using v3 search API."""
-    data = kalshi_json(f"/markets?search={CFP_PREFIX}")
+    # Some responses contain garbage "Associated Markets" keys → remove invalid entries
     markets = data.get("markets", [])
+    clean = []
 
-    # Log sample of what we're getting
-    print(f"RAW_RESPONSE_COUNT={len(markets)}")
-
-    # Keep only real CFP yes/no markets
-    cfp = []
     for m in markets:
-        t = m.get("ticker", "")
-        if t.startswith(CFP_PREFIX) and m.get("yes_price") is not None:
-            cfp.append(m)
+        # Valid markets MUST have ticker + yes_price or last_price
+        if not isinstance(m, dict):
+            continue
+        if "ticker" not in m:
+            continue
+        clean.append(m)
 
-    print(f"FOUND_CFP_MARKETS={len(cfp)}")
-    return cfp
-
-
-def fetch_market_details(ticker: str):
-    """Fetch a single market by ticker."""
-    data = kalshi_json(f"/market?ticker={ticker}")
-    return data.get("market", {})
+    return clean
 
 
-# ============================================================
-# POLLER LOOP
-# ============================================================
-
-prev_prices = {}
-
-def poll_once():
-    global prev_prices
-
-    now = datetime.now(timezone.utc)
-
+# ---------------------
+# POLLING LOGIC
+# ---------------------
+def poll_once(last_prices):
     markets = fetch_cfp_markets()
+    ts = datetime.utcnow().isoformat()
+
     if not markets:
-        print(f"{now.isoformat()} | No CFP markets found in v3 search")
-        return
+        print(f"{ts} | No markets returned.")
+        return last_prices, 0
 
-    batch = db.batch()
     movers = []
-
     for m in markets:
-        t = m["ticker"]
-        title = m.get("title", t)
-        yes_price = m.get("yes_price")
-        no_price = m.get("no_price")
-        volume = m.get("volume")
+        ticker = m.get("ticker")
+        yesp = m.get("yes_price")
+        lastp = m.get("last_price")
 
-        # ------------------------
-        # Store snapshot
-        # ------------------------
-        doc_ref = db.collection("cfp_markets").document(t)
-        batch.set(
-            doc_ref,
-            {
-                "ticker": t,
-                "team": title,
-                "yes_price": yes_price,
-                "no_price": no_price,
-                "volume": volume,
-                "updated_at": now,
-            },
-            merge=True
-        )
+        price = yesp if yesp is not None else lastp
+        if price is None:
+            continue
 
-        # ------------------------
-        # Movement detection
-        # ------------------------
-        prev = prev_prices.get(t)
-        if prev is not None and yes_price is not None and yes_price != prev:
-            diff = yes_price - prev
+        prev = last_prices.get(ticker)
 
+        # First time seen
+        if prev is None:
+            last_prices[ticker] = price
+            continue
+
+        # Detect movement ≥ 1 point
+        diff = price - prev
+        if abs(diff) >= 1:
             movers.append({
-                "ticker": t,
-                "team": title,
-                "prev_yes": prev,
-                "curr_yes": yes_price,
-                "diff": diff,
-                "significant": abs(diff) >= MIN_MOVE,
-                "detected_at": now,
+                "ticker": ticker,
+                "change": diff,
+                "old": prev,
+                "new": price,
+                "ts": ts
             })
 
-        if yes_price is not None:
-            prev_prices[t] = yes_price
+            last_prices[ticker] = price
 
-    batch.commit()
+    # Write movers into Firebase
+    if movers:
+        doc = db.collection("movers").document(ts)
+        doc.set({
+            "timestamp": ts,
+            "count": len(movers),
+            "items": movers
+        })
 
-    # Store movers
-    for mv in movers:
-        db.collection("cfp_movers").add(mv)
+    print(f"{ts} | tickers={len(markets)} | movers={len(movers)}")
 
-    print(
-        f"{now.isoformat()} | tickers={len(markets)} "
-        f"| movers={len(movers)} "
-        f"| examples={movers[:2]}"
-    )
+    return last_prices, len(movers)
 
 
-# ============================================================
+# ---------------------
 # MAIN LOOP
-# ============================================================
+# ---------------------
+def main():
+    last_prices = {}
+    print("🚀 Worker started with BASE =", BASE)
 
-if __name__ == "__main__":
-    print("=== CFP WORKER STARTED (v3 API) ===")
     while True:
         try:
-            poll_once()
+            last_prices, mover_count = poll_once(last_prices)
         except Exception as e:
-            print("ERROR in poller:", e)
-        time.sleep(POLL_INTERVAL)
+            print("❌ ERROR in poller:", e)
+
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
