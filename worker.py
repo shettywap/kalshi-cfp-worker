@@ -3,54 +3,68 @@ import time
 import json
 import base64
 import requests
+import traceback
 from urllib.parse import urlparse
 from datetime import datetime
+
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-import firebase_admin
-from firebase_admin import credentials, firestore
+from google.cloud import firestore_v1
+from google.oauth2 import service_account
 
-print("📄 Importing worker.py...", flush=True)
+print("📄 Importing worker.py (REST Firestore)...", flush=True)
 
-# ---------------------
-# FIREBASE INIT
-# ---------------------
-db = None
+# =====================
+# FIRESTORE INIT (REST)
+# =====================
 
-def init_firebase():
-    global db
-    if firebase_admin._apps:
-        print("✅ Firebase already initialized", flush=True)
-        db = firestore.client()
-        return
-
+def init_firestore():
+    """
+    Initialize a Firestore client using REST transport and a service account JSON
+    stored in FIREBASE_SERVICE_ACCOUNT_JSON.
+    """
     try:
-        print("🔑 Loading FIREBASE_SERVICE_ACCOUNT_JSON...", flush=True)
-        firebase_sa_json = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
+        sa_raw = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
+        print("🔑 Loaded FIREBASE_SERVICE_ACCOUNT_JSON from env", flush=True)
     except KeyError:
         print("❌ Missing env var: FIREBASE_SERVICE_ACCOUNT_JSON", flush=True)
         raise
 
     try:
-        cred_dict = json.loads(firebase_sa_json)
+        sa_info = json.loads(sa_raw)
     except json.JSONDecodeError as e:
-        print("❌ Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON as JSON:", e, flush=True)
+        print("❌ FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON:", e, flush=True)
         raise
+
+    project_id = sa_info.get("project_id")
+    if not project_id:
+        print("❌ Service account JSON has no 'project_id'", flush=True)
+        raise RuntimeError("Service account JSON missing project_id")
 
     try:
-        cred = credentials.Certificate(cred_dict)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print("✅ Firebase initialized", flush=True)
+        creds = service_account.Credentials.from_service_account_info(sa_info)
+        # Use REST transport explicitly
+        client = firestore_v1.Client(
+            project=project_id,
+            credentials=creds,
+            client_options={"api_endpoint": "firestore.googleapis.com"},
+            transport="rest"
+        )
+        print(f"✅ Firestore client initialized (project={project_id}, transport=rest)", flush=True)
+        return client
     except Exception as e:
-        print("❌ Error initializing Firebase:", repr(e), flush=True)
+        print("❌ Error initializing Firestore client:", repr(e), flush=True)
+        traceback.print_exc()
         raise
 
 
-# ---------------------
+db = init_firestore()
+
+# =====================
 # KALSHI CONFIG
-# ---------------------
+# =====================
+
 try:
     API_KEY = os.environ["KALSHI_API_KEY_ID"]
     print("✅ Loaded KALSHI_API_KEY_ID", flush=True)
@@ -61,7 +75,6 @@ except KeyError:
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 CFP_EVENT = "KXNCAAFPLAYOFF-25"
 
-# How big a move counts as "major"
 try:
     MIN_MOVE = float(os.getenv("MIN_MOVE", "1.0"))
     print(f"✅ MIN_MOVE set to {MIN_MOVE}", flush=True)
@@ -69,7 +82,7 @@ except ValueError:
     print("❌ MIN_MOVE is not a valid number", flush=True)
     raise
 
-# Load private key (PEM)
+# Load Kalshi private key (PEM)
 try:
     private_key_pem = os.environ["KALSHI_PRIVATE_KEY_PEM"].encode()
     private_key = serialization.load_pem_private_key(
@@ -82,12 +95,14 @@ except KeyError:
     raise
 except Exception as e:
     print("❌ Error loading private key:", repr(e), flush=True)
+    traceback.print_exc()
     raise
 
 
-# ---------------------
+# =====================
 # SIGNED REQUEST
-# ---------------------
+# =====================
+
 def kalshi_signed_request(method, url, body=None):
     path = urlparse(url).path
     timestamp = str(int(time.time() * 1000))
@@ -103,7 +118,8 @@ def kalshi_signed_request(method, url, body=None):
             hashes.SHA256()
         )
     except Exception as e:
-        print("❌ Error signing message:", repr(e), flush=True)
+        print("❌ Error signing Kalshi message:", repr(e), flush=True)
+        traceback.print_exc()
         return None
 
     signature = base64.b64encode(signature_bytes).decode()
@@ -121,24 +137,24 @@ def kalshi_signed_request(method, url, body=None):
         else:
             return requests.post(url, headers=headers, data=json.dumps(body or {}), timeout=10)
     except requests.exceptions.RequestException as e:
-        print("❌ HTTP ERROR:", e, flush=True)
+        print("❌ HTTP ERROR talking to Kalshi:", e, flush=True)
+        traceback.print_exc()
         return None
 
 
-# ---------------------
+# =====================
 # FETCH MARKETS
-# ---------------------
+# =====================
+
 def fetch_cfp_markets():
     url = f"{BASE}/markets?event_ticker={CFP_EVENT}&limit=500"
     print(f"🌐 Fetching markets from {url}", flush=True)
 
     resp = kalshi_signed_request("GET", url)
-
     if resp is None:
         print("❌ No response from Kalshi", flush=True)
         return []
 
-    # Handle non-JSON
     try:
         data = resp.json()
     except Exception:
@@ -146,7 +162,7 @@ def fetch_cfp_markets():
         return []
 
     if resp.status_code != 200:
-        print("❌ API ERROR:", resp.status_code, data, flush=True)
+        print("❌ Kalshi API ERROR:", resp.status_code, data, flush=True)
         return []
 
     markets = data.get("markets", [])
@@ -163,9 +179,10 @@ def fetch_cfp_markets():
     return clean
 
 
-# ---------------------
+# =====================
 # POLLING + FIRESTORE WRITE
-# ---------------------
+# =====================
+
 def poll_once(last_prices):
     markets = fetch_cfp_markets()
     ts = datetime.utcnow().isoformat() + "Z"
@@ -174,7 +191,7 @@ def poll_once(last_prices):
         print(f"{ts} | No markets returned.", flush=True)
         return last_prices, 0
 
-    # --- Write current odds for ticker tape ---
+    # ---- Current odds doc for ticker tape ----
     ticker_payload = []
     for m in markets:
         ticker = m.get("ticker")
@@ -208,11 +225,12 @@ def poll_once(last_prices):
             "event_ticker": CFP_EVENT,
             "markets": ticker_payload
         })
-        print(f"{ts} | ✅ Wrote {len(ticker_payload)} markets to Firestore", flush=True)
+        print(f"{ts} | ✅ Wrote {len(ticker_payload)} markets to Firestore (cfp_markets/current)", flush=True)
     except Exception as e:
         print("❌ Error writing current markets to Firestore:", repr(e), flush=True)
+        traceback.print_exc()
 
-    # --- Detect major movers ---
+    # ---- Detect major movers ----
     movers = []
     for m in markets:
         ticker = m.get("ticker")
@@ -257,21 +275,22 @@ def poll_once(last_prices):
             print(f"{ts} | 🚨 Recorded {len(movers)} movers", flush=True)
         except Exception as e:
             print("❌ Error writing movers to Firestore:", repr(e), flush=True)
+            traceback.print_exc()
     else:
         print(f"{ts} | No movers this tick", flush=True)
 
     return last_prices, len(movers)
 
 
-# ---------------------
+# =====================
 # MAIN LOOP
-# ---------------------
-def main():
-    print("🚀 Starting worker main()", flush=True)
-    init_firebase()
+# =====================
 
+def main():
+    print("🚀 Worker main() starting", flush=True)
     last_prices = {}
-    print("✅ Worker fully initialized", flush=True)
+
+    print("✅ Worker initialized", flush=True)
     print("   BASE     =", BASE, flush=True)
     print("   EVENT    =", CFP_EVENT, flush=True)
     print("   MIN_MOVE =", MIN_MOVE, flush=True)
@@ -280,7 +299,8 @@ def main():
         try:
             last_prices, _ = poll_once(last_prices)
         except Exception as e:
-            print("❌ ERROR in poller:", repr(e), flush=True)
+            print("❌ ERROR in poller loop:", repr(e), flush=True)
+            traceback.print_exc()
 
         time.sleep(5)
 
