@@ -13,7 +13,21 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from google.cloud import firestore_v1
 from google.oauth2 import service_account
 
-print("📄 Importing worker.py (Firestore via google-cloud-firestore)...", flush=True)
+print("📄 Importing worker.py...", flush=True)
+
+# =====================
+# CONFIG
+# =====================
+
+# How big a move (in points) counts as "major"
+MIN_MOVE = float(os.getenv("MIN_MOVE", "1.0"))
+
+# How often (in seconds) to write the big cfp_markets/current doc
+WRITE_INTERVAL = float(os.getenv("WRITE_INTERVAL", "60"))  # default: 60s
+
+BASE = "https://api.elections.kalshi.com/trade-api/v2"
+CFP_EVENT = "KXNCAAFPLAYOFF-25"
+
 
 # =====================
 # FIRESTORE INIT
@@ -44,7 +58,6 @@ def init_firestore():
 
     try:
         creds = service_account.Credentials.from_service_account_info(sa_info)
-        # Older versions of google-cloud-firestore use this simple signature
         client = firestore_v1.Client(
             project=project_id,
             credentials=creds,
@@ -59,6 +72,7 @@ def init_firestore():
 
 db = init_firestore()
 
+
 # =====================
 # KALSHI CONFIG
 # =====================
@@ -68,16 +82,6 @@ try:
     print("✅ Loaded KALSHI_API_KEY_ID", flush=True)
 except KeyError:
     print("❌ Missing env var: KALSHI_API_KEY_ID", flush=True)
-    raise
-
-BASE = "https://api.elections.kalshi.com/trade-api/v2"
-CFP_EVENT = "KXNCAAFPLAYOFF-25"
-
-try:
-    MIN_MOVE = float(os.getenv("MIN_MOVE", "1.0"))
-    print(f"✅ MIN_MOVE set to {MIN_MOVE}", flush=True)
-except ValueError:
-    print("❌ MIN_MOVE is not a valid number", flush=True)
     raise
 
 # Load Kalshi private key (PEM)
@@ -181,15 +185,15 @@ def fetch_cfp_markets():
 # POLLING + FIRESTORE WRITE
 # =====================
 
-def poll_once(last_prices):
+def poll_once(last_prices, last_write_ts):
     markets = fetch_cfp_markets()
     ts = datetime.utcnow().isoformat() + "Z"
 
     if not markets:
         print(f"{ts} | No markets returned.", flush=True)
-        return last_prices, 0
+        return last_prices, last_write_ts, 0
 
-    # ---- Current odds doc for ticker tape ----
+    # ---- Build payload for current odds doc (ticker tape) ----
     ticker_payload = []
     for m in markets:
         ticker = m.get("ticker")
@@ -217,16 +221,38 @@ def poll_once(last_prices):
             "probability": prob
         })
 
-    try:
-        db.collection("cfp_markets").document("current").set({
-            "timestamp": ts,
-            "event_ticker": CFP_EVENT,
-            "markets": ticker_payload
-        })
-        print(f"{ts} | ✅ Wrote {len(ticker_payload)} markets to Firestore (cfp_markets/current)", flush=True)
-    except Exception as e:
-        print("❌ Error writing current markets to Firestore:", repr(e), flush=True)
-        traceback.print_exc()
+    # ---- Throttled write of current odds (cfp_markets/current) ----
+    now = time.time()
+    if now - last_write_ts >= WRITE_INTERVAL:
+        try:
+            db.collection("cfp_markets").document("current").set({
+                "timestamp": ts,
+                "event_ticker": CFP_EVENT,
+                "markets": ticker_payload
+            })
+            last_write_ts = now
+            print(
+                f"{ts} | ✅ Wrote {len(ticker_payload)} markets to Firestore "
+                f"(cfp_markets/current) | interval={WRITE_INTERVAL}s",
+                flush=True
+            )
+        except Exception as e:
+            msg = str(e)
+            if "Quota exceeded" in msg or "429" in msg:
+                print(
+                    f"{ts} | ⚠️ Firestore quota exceeded on current-markets write. "
+                    f"Will retry after interval. Raw error: {repr(e)}",
+                    flush=True
+                )
+            else:
+                print("❌ Error writing current markets to Firestore:", repr(e), flush=True)
+                traceback.print_exc()
+    else:
+        print(
+            f"{ts} | ⏭ Skipping Firestore current-markets write; only "
+            f"{now - last_write_ts:.1f}s since last write (interval={WRITE_INTERVAL}s)",
+            flush=True
+        )
 
     # ---- Detect major movers ----
     movers = []
@@ -272,12 +298,20 @@ def poll_once(last_prices):
             })
             print(f"{ts} | 🚨 Recorded {len(movers)} movers", flush=True)
         except Exception as e:
-            print("❌ Error writing movers to Firestore:", repr(e), flush=True)
-            traceback.print_exc()
+            msg = str(e)
+            if "Quota exceeded" in msg or "429" in msg:
+                print(
+                    f"{ts} | ⚠️ Firestore quota exceeded on movers write. "
+                    f"Raw error: {repr(e)}",
+                    flush=True
+                )
+            else:
+                print("❌ Error writing movers to Firestore:", repr(e), flush=True)
+                traceback.print_exc()
     else:
         print(f"{ts} | No movers this tick", flush=True)
 
-    return last_prices, len(movers)
+    return last_prices, last_write_ts, len(movers)
 
 
 # =====================
@@ -287,15 +321,17 @@ def poll_once(last_prices):
 def main():
     print("🚀 Worker main() starting", flush=True)
     last_prices = {}
+    last_write_ts = 0.0  # force an initial write
 
     print("✅ Worker initialized", flush=True)
-    print("   BASE     =", BASE, flush=True)
-    print("   EVENT    =", CFP_EVENT, flush=True)
-    print("   MIN_MOVE =", MIN_MOVE, flush=True)
+    print("   BASE           =", BASE, flush=True)
+    print("   EVENT          =", CFP_EVENT, flush=True)
+    print("   MIN_MOVE       =", MIN_MOVE, flush=True)
+    print("   WRITE_INTERVAL =", WRITE_INTERVAL, "seconds", flush=True)
 
     while True:
         try:
-            last_prices, _ = poll_once(last_prices)
+            last_prices, last_write_ts, _ = poll_once(last_prices, last_write_ts)
         except Exception as e:
             print("❌ ERROR in poller loop:", repr(e), flush=True)
             traceback.print_exc()
