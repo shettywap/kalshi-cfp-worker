@@ -17,9 +17,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
 
-# MUST BE THIS. Sports markets also come from this API.
-BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+# MUST BE https://api.elections.kalshi.com/trade-api/v2
+BASE_URL = os.getenv(
+    "KALSHI_BASE_URL",
+    "https://api.elections.kalshi.com/trade-api/v2"
+)
 
+# CFP prefix — WE NOW SEARCH BY PREFIX, NOT EVENT GROUPING
 CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
 
 MIN_MOVE = float(os.getenv("MIN_MOVE", "0.5"))
@@ -36,7 +40,7 @@ if not FIREBASE_SERVICE_ACCOUNT_JSON:
 
 
 # ==========================
-# FIRESTORE CLIENT
+# FIRESTORE
 # ==========================
 
 service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
@@ -55,7 +59,6 @@ def load_private_key():
     )
 
 PRIVATE_KEY = load_private_key()
-
 
 def sign_message(message: str) -> str:
     signature = PRIVATE_KEY.sign(
@@ -84,7 +87,7 @@ def kalshi_signed_get(path: str):
     message = timestamp + method + parsed.path
 
     headers = {
-        "KALSHHI-ACCESS-KEY": API_KEY_ID,
+        "KALSHI-ACCESS-KEY": API_KEY_ID,
         "KALSHI-ACCESS-TIMESTAMP": timestamp,
         "KALSHI-ACCESS-SIGNATURE": sign_message(message),
         "Content-Type": "application/json",
@@ -100,41 +103,48 @@ def kalshi_get_json(path: str):
     except:
         raise RuntimeError(f"Non-JSON ({resp.status_code}): {resp.text[:200]}")
     if resp.status_code != 200:
-        raise RuntimeError(f"Kalshi returned {resp.status_code}:\n{json.dumps(data, indent=2)}")
+        raise RuntimeError(
+            f"Kalshi returned {resp.status_code}:\n{json.dumps(data, indent=2)}"
+        )
     return data
 
 
 # ==========================
-# MARKET FETCHING
+# MARKET FETCHING (FIXED)
 # ==========================
 
 def fetch_cfp_market_tickers():
-    """Return ONLY real market tickers (skip event objects)."""
-    data = kalshi_get_json(f"/markets?event_ticker={CFP_EVENT_TICKER}")
+    """
+    Fetch CFP markets using prefix search, because Kalshi does NOT attach
+    these markets to the event group. Your Colab uses these tickers:
+    KXNCAAFPLAYOFF-25-OSU, KXNCAAFPLAYOFF-25-ND, etc.
+    """
+    path = f"/markets?search={CFP_EVENT_TICKER}-"
+    data = kalshi_get_json(path)
 
-    # PRINT RAW FOR DEBUG — This will reveal the real issue if markets=0.
+    # DEBUG: Show raw response
     print("RAW_MARKETS_RESPONSE:", json.dumps(data, indent=2)[:800])
 
     markets = data.get("markets", [])
-    real = []
 
-    for m in markets:
-        # Market = has yes/no prices OR has type "market"
-        if m.get("yes_price") is not None or m.get("no_price") is not None:
-            real.append(m["ticker"])
+    # CFP markets have YES/NO prices.
+    tickers = [
+        m["ticker"]
+        for m in markets
+        if m.get("yes_price") is not None
+    ]
 
-    print(f"FOUND {len(markets)} entries, {len(real)} real markets")
-    return real
+    print(f"FOUND {len(markets)} total entries, {len(tickers)} real CFP markets")
+    return tickers
 
 
 def fetch_market(ticker: str):
-    """Get full market details."""
     data = kalshi_get_json(f"/market?ticker={ticker}")
     return data.get("market", {})
 
 
 # ==========================
-# POLLER LOOP
+# POLLING LOOP
 # ==========================
 
 prev_prices = {}
@@ -153,10 +163,11 @@ def process_once():
         m = fetch_market(t)
 
         yes_price = m.get("yes_price")
+        no_price = m.get("no_price")
         title = m.get("title", t)
         volume = m.get("volume")
 
-        # save market
+        # Save market snapshot
         doc_ref = db.collection("cfp_markets").document(t)
         batch.set(
             doc_ref,
@@ -164,6 +175,7 @@ def process_once():
                 "ticker": t,
                 "team": title,
                 "yes_price": yes_price,
+                "no_price": no_price,
                 "volume": volume,
                 "event_ticker": CFP_EVENT_TICKER,
                 "updated_at": now,
@@ -171,7 +183,7 @@ def process_once():
             merge=True,
         )
 
-        # detect price move
+        # Detect movement
         prev = prev_prices.get(t)
         if prev is not None and yes_price is not None and yes_price != prev:
             diff = yes_price - prev
