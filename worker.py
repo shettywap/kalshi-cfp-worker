@@ -13,16 +13,16 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from google.cloud import firestore_v1
 from google.oauth2 import service_account
 
-print("📄 Importing worker.py (REST Firestore)...", flush=True)
+print("📄 Importing worker.py (Firestore via google-cloud-firestore)...", flush=True)
 
 # =====================
-# FIRESTORE INIT (REST)
+# FIRESTORE INIT
 # =====================
 
 def init_firestore():
     """
-    Initialize a Firestore client using REST transport and a service account JSON
-    stored in FIREBASE_SERVICE_ACCOUNT_JSON.
+    Initialize a Firestore client using service account JSON
+    from FIREBASE_SERVICE_ACCOUNT_JSON.
     """
     try:
         sa_raw = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
@@ -44,14 +44,12 @@ def init_firestore():
 
     try:
         creds = service_account.Credentials.from_service_account_info(sa_info)
-        # Use REST transport explicitly
+        # Older versions of google-cloud-firestore use this simple signature
         client = firestore_v1.Client(
             project=project_id,
             credentials=creds,
-            client_options={"api_endpoint": "firestore.googleapis.com"},
-            transport="rest"
         )
-        print(f"✅ Firestore client initialized (project={project_id}, transport=rest)", flush=True)
+        print(f"✅ Firestore client initialized (project={project_id})", flush=True)
         return client
     except Exception as e:
         print("❌ Error initializing Firestore client:", repr(e), flush=True)
