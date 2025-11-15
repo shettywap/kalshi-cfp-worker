@@ -14,8 +14,11 @@ from firebase_admin import credentials, firestore
 # ---------------------
 # FIREBASE INIT
 # ---------------------
+# Railway env: FIREBASE_SERVICE_ACCOUNT_JSON (full JSON string)
 if not firebase_admin._apps:
-    cred = credentials.Certificate(json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"]))
+    firebase_sa_json = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
+    cred_dict = json.loads(firebase_sa_json)
+    cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
@@ -23,21 +26,31 @@ db = firestore.client()
 # ---------------------
 # KALSHI CONFIG
 # ---------------------
-API_KEY = os.environ["KALSHI_API_KEY"]
+# Railway envs:
+#   KALSHI_API_KEY_ID
+#   KALSHI_PRIVATE_KEY_PEM
+API_KEY = os.environ["KALSHI_API_KEY_ID"]
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 CFP_EVENT = "KXNCAAFPLAYOFF-25"
 
-# Load private key
+# How big a move (in price points) counts as "major"
+MIN_MOVE = float(os.getenv("MIN_MOVE", "1.0"))
+
+# Load private key (PEM)
+private_key_pem = os.environ["KALSHI_PRIVATE_KEY_PEM"].encode()
 private_key = serialization.load_pem_private_key(
-    os.environ["KALSHI_PRIVATE_KEY"].encode(),
+    private_key_pem,
     password=None
 )
 
 # ---------------------
-# SIGNED REQUEST (EXACT COLAB VERSION)
+# SIGNED REQUEST
 # ---------------------
 def kalshi_signed_request(method, url, body=None):
+    """
+    Sign a Kalshi request using the same logic that worked in Colab.
+    """
     path = urlparse(url).path
     timestamp = str(int(time.time() * 1000))
     message = timestamp + method.upper() + path
@@ -60,10 +73,14 @@ def kalshi_signed_request(method, url, body=None):
         "Content-Type": "application/json"
     }
 
-    if method == "GET":
-        return requests.get(url, headers=headers)
-    else:
-        return requests.post(url, headers=headers, data=json.dumps(body))
+    try:
+        if method.upper() == "GET":
+            return requests.get(url, headers=headers, timeout=10)
+        else:
+            return requests.post(url, headers=headers, data=json.dumps(body or {}), timeout=10)
+    except requests.exceptions.RequestException as e:
+        print("❌ HTTP ERROR:", e)
+        return None
 
 
 # ---------------------
@@ -73,23 +90,25 @@ def fetch_cfp_markets():
     url = f"{BASE}/markets?event_ticker={CFP_EVENT}&limit=500"
     resp = kalshi_signed_request("GET", url)
 
+    if resp is None:
+        return []
+
     # Handle non-JSON
     try:
         data = resp.json()
-    except:
-        print("❌ NON-JSON RESPONSE:", resp.text)
+    except Exception:
+        print("❌ NON-JSON RESPONSE:", resp.text[:500])
         return []
 
     if resp.status_code != 200:
-        print("❌ API ERROR:", data)
+        print("❌ API ERROR:", resp.status_code, data)
         return []
 
-    # Some responses contain garbage "Associated Markets" keys → remove invalid entries
     markets = data.get("markets", [])
     clean = []
 
     for m in markets:
-        # Valid markets MUST have ticker + yes_price or last_price
+        # Valid markets MUST have ticker and at least one price field
         if not isinstance(m, dict):
             continue
         if "ticker" not in m:
@@ -100,16 +119,54 @@ def fetch_cfp_markets():
 
 
 # ---------------------
-# POLLING LOGIC
+# POLLING + FIREBASE WRITE
 # ---------------------
 def poll_once(last_prices):
     markets = fetch_cfp_markets()
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.utcnow().isoformat() + "Z"
 
     if not markets:
         print(f"{ts} | No markets returned.")
         return last_prices, 0
 
+    # --- Write current odds for ticker tape ---
+    ticker_payload = []
+    for m in markets:
+        ticker = m.get("ticker")
+        yesp = m.get("yes_price")
+        lastp = m.get("last_price")
+        best_bid = m.get("best_bid")
+        best_ask = m.get("best_ask")
+
+        # Choose a representative price (yes_price preferred)
+        price = yesp if yesp is not None else lastp
+        if price is None:
+            continue
+
+        # Probability as 0–1 if price is in points (0–100)
+        prob = None
+        try:
+            prob = float(price) / 100.0
+        except Exception:
+            pass
+
+        ticker_payload.append({
+            "ticker": ticker,
+            "yes_price": yesp,
+            "last_price": lastp,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "probability": prob
+        })
+
+    # Single doc used by the app for the live ticker
+    db.collection("cfp_markets").document("current").set({
+        "timestamp": ts,
+        "event_ticker": CFP_EVENT,
+        "markets": ticker_payload
+    })
+
+    # --- Detect major movers ---
     movers = []
     for m in markets:
         ticker = m.get("ticker")
@@ -120,36 +177,42 @@ def poll_once(last_prices):
         if price is None:
             continue
 
+        try:
+            price = float(price)
+        except Exception:
+            continue
+
         prev = last_prices.get(ticker)
 
-        # First time seen
+        # First time for this ticker: just initialize
         if prev is None:
             last_prices[ticker] = price
             continue
 
-        # Detect movement ≥ 1 point
         diff = price - prev
-        if abs(diff) >= 1:
+        if abs(diff) >= MIN_MOVE:
             movers.append({
                 "ticker": ticker,
                 "change": diff,
                 "old": prev,
                 "new": price,
-                "ts": ts
+                "timestamp": ts
             })
+            last_prices[ticker] = price  # update stored price
 
-            last_prices[ticker] = price
-
-    # Write movers into Firebase
+    # --- Write movers for alerting ---
     if movers:
-        doc = db.collection("movers").document(ts)
-        doc.set({
+        # Use timestamp as doc id so they’re naturally ordered
+        doc_ref = db.collection("movers").document(ts)
+        doc_ref.set({
             "timestamp": ts,
+            "event_ticker": CFP_EVENT,
+            "min_move": MIN_MOVE,
             "count": len(movers),
             "items": movers
         })
 
-    print(f"{ts} | tickers={len(markets)} | movers={len(movers)}")
+    print(f"{ts} | tickers={len(ticker_payload)} | movers={len(movers)}")
 
     return last_prices, len(movers)
 
@@ -159,14 +222,19 @@ def poll_once(last_prices):
 # ---------------------
 def main():
     last_prices = {}
-    print("🚀 Worker started with BASE =", BASE)
+    print("🚀 Worker started")
+    print("   BASE =", BASE)
+    print("   EVENT =", CFP_EVENT)
+    print("   MIN_MOVE =", MIN_MOVE)
 
     while True:
         try:
             last_prices, mover_count = poll_once(last_prices)
         except Exception as e:
-            print("❌ ERROR in poller:", e)
+            # Keep the worker alive on unexpected errors
+            print("❌ ERROR in poller:", repr(e))
 
+        # Poll every 5 seconds
         time.sleep(5)
 
 
