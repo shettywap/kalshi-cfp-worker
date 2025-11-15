@@ -16,13 +16,15 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
+
+# IMPORTANT: this *must* be the Elections API base. It includes sports.
 BASE_URL = os.getenv(
     "KALSHI_BASE_URL",
     "https://api.elections.kalshi.com/trade-api/v2",
 )
+
 CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
 
-# Default: small threshold, but we now log ALL changes anyway
 MIN_MOVE = float(os.getenv("MIN_MOVE", "0.5"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
 
@@ -107,22 +109,36 @@ def kalshi_get_json(path: str):
         raise RuntimeError(f"Non-JSON ({resp.status_code}): {resp.text[:200]}")
     if resp.status_code != 200:
         raise RuntimeError(
-            f"Kalshi {resp.status_code} for {path}:\n" + json.dumps(data, indent=2)
+            f"Kalshi returned {resp.status_code} for {path}:\n"
+            + json.dumps(data, indent=2)
         )
     return data
 
 
+# ==========================
+#  EVENT → MARKET TICKERS
+# ==========================
+
+def fetch_cfp_market_tickers():
+    data = kalshi_get_json(f"/event?ticker={CFP_EVENT_TICKER}")
+    return data["event"].get("markets", [])
+
+
 def fetch_cfp_markets():
-    data = kalshi_get_json(f"/markets?event_ticker={CFP_EVENT_TICKER}&limit=1000")
-    return data.get("markets", [])
+    tickers = fetch_cfp_market_tickers()
+    markets = []
+    for t in tickers:
+        md = kalshi_get_json(f"/market?ticker={t}")
+        market = md.get("market", {})
+        markets.append(market)
+    return markets
 
 
 # ==========================
 #  POLLER LOOP
 # ==========================
 
-# In-memory map of last seen YES prices, per ticker
-prev_prices = {}  # ticker -> last YES
+prev_prices = {}  # ticker -> last YES seen
 
 
 def process_once():
@@ -135,23 +151,22 @@ def process_once():
     movers_to_add = []
 
     changed_count = 0
-    max_diff = 0.0
-    sample_changes = []  # collect a few examples for logging
+    sample_changes = []
 
     for m in markets:
         ticker = m.get("ticker")
-        team = m.get("title", ticker)
+        title = m.get("title", ticker)
         yes_price = m.get("yes_price")
         no_price = m.get("no_price")
         volume = m.get("volume")
 
-        # 1) Upsert current market doc (one doc per ticker)
+        # Update Firestore market doc
         doc_ref = db.collection("cfp_markets").document(ticker)
         batch.set(
             doc_ref,
             {
-                "team": team,
                 "ticker": ticker,
+                "team": title,
                 "yes_price": yes_price,
                 "no_price": no_price,
                 "volume": volume,
@@ -161,56 +176,36 @@ def process_once():
             merge=True,
         )
 
-        # 2) Movement detection relative to last seen
-        prev_yes = prev_prices.get(ticker)
-        if yes_price is not None and prev_yes is not None:
-            diff = yes_price - prev_yes
-            if diff != 0:
-                changed_count += 1
-                max_diff = max(max_diff, abs(diff))
+        # Movement detection
+        prev = prev_prices.get(ticker)
+        if prev is not None and yes_price is not None and yes_price != prev:
+            diff = yes_price - prev
+            changed_count += 1
+            if len(sample_changes) < 5:
+                sample_changes.append(f"{ticker}: {prev} → {yes_price} (diff={diff})")
 
-                # Record a few examples for the logs
-                if len(sample_changes) < 5:
-                    sample_changes.append(
-                        f"{ticker}: {prev_yes} -> {yes_price} (diff={diff})"
-                    )
+            movers_to_add.append({
+                "ticker": ticker,
+                "team": title,
+                "prev_yes": prev,
+                "curr_yes": yes_price,
+                "diff": diff,
+                "significant": abs(diff) >= MIN_MOVE,
+                "detected_at": now,
+                "event_ticker": CFP_EVENT_TICKER,
+            })
 
-                # Log EVERY change as a mover
-                significant = abs(diff) >= MIN_MOVE
-
-                movers_to_add.append({
-                    "team": team,
-                    "ticker": ticker,
-                    "prev_yes": prev_yes,
-                    "curr_yes": yes_price,
-                    "diff": diff,
-                    "significant": significant,
-                    "event_ticker": CFP_EVENT_TICKER,
-                    "detected_at": now,
-                })
-
-        # Update last seen price
         if yes_price is not None:
             prev_prices[ticker] = yes_price
 
-    # Commit market updates in one batch
     batch.commit()
 
-    # Commit movers as individual docs
     for mv in movers_to_add:
         db.collection("cfp_movers").add(mv)
 
-    # Build a compact summary line for the logs
-    if sample_changes:
-        sample_str = " | ".join(sample_changes)
-    else:
-        sample_str = "no price changes this cycle"
-
     print(
-        f"{now.isoformat()} - updated {len(markets)} markets, "
-        f"{len(movers_to_add)} movers (any change), "
-        f"tickers with any change: {changed_count}, "
-        f"max diff: {max_diff}, MIN_MOVE={MIN_MOVE} | samples: {sample_str}"
+        f"{now.isoformat()} | markets: {len(markets)} | movers: {len(movers_to_add)} | "
+        f"changed tickers: {changed_count} | samples: {sample_changes or 'none'}"
     )
 
 
@@ -219,5 +214,5 @@ if __name__ == "__main__":
         try:
             process_once()
         except Exception as e:
-            print("Error in poller:", e)
+            print("Error:", e)
         time.sleep(POLL_INTERVAL)
